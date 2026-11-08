@@ -50,6 +50,10 @@
 #include "isobus/hardware_integration/ntcan_plugin.hpp"
 #endif
 
+#ifdef ISOBUS_AX141150_AVAILABLE
+#include "isobus/hardware_integration/axiomatic_ax141150_plugin.hpp"
+#endif
+
 #ifdef ISOBUS_SILKIT_AVAILABLE
 #include "isobus/hardware_integration/sil_kit_plugin.hpp"
 #endif
