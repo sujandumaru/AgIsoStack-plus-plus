@@ -68,6 +68,10 @@ set(TEST_SRC
     helpers/control_function_helpers.cpp
     helpers/messaging_helpers.cpp)
 
+if("AX141150" IN_LIST CAN_DRIVER)
+  list(APPEND TEST_SRC axiomatic_ax141150_plugin_tests.cpp)
+endif()
+
 if(CAN_STACK_DISABLE_THREADS)
   # Most tests run on the VirtualCAN driver, which needs threads. Without
   # threads, build the tests for the single-threaded code paths only.

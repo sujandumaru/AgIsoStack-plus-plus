@@ -31,7 +31,6 @@
 #include "isobus/isobus/can_message_frame.hpp"
 #include "isobus/utility/thread_synchronization.hpp"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -63,15 +62,21 @@ namespace isobus
 			RemoteAccess = 0x22 ///< The PIN used by a remote CAN2BT node in bridge-pair setups
 		};
 
-		/// @brief The SPP message types used by this driver
+		/// @brief The SPP message types this driver sends or recognises
 		enum class MessageType : std::uint8_t
 		{
 			CANDataStandardToDevice = 0x12, ///< Host -> CAN2BT, 11-bit identifier frame
 			CANDataExtendedToDevice = 0x13, ///< Host -> CAN2BT, 29-bit identifier frame
 			CANDataStandardFromDevice = 0x21, ///< CAN2BT -> host, 11-bit identifier frame
 			CANDataExtendedFromDevice = 0x31, ///< CAN2BT -> host, 29-bit identifier frame
+			MapWriteResponse = 0x43, ///< CAN2BT -> host, MAP write response (ignored)
+			MapReadResponse = 0x54, ///< CAN2BT -> host, MAP read response (ignored)
+			DownloadFlashResponse = 0x65, ///< CAN2BT -> host, download flash contents response (ignored)
 			ChangeConfiguration = 0x67, ///< Host -> CAN2BT, configuration command
+			DownloadFlashAcknowledgeResponse = 0x75, ///< CAN2BT -> host, download flash contents ACK response (ignored)
 			ChangeConfigurationResponse = 0x76, ///< CAN2BT -> host, acknowledgement of a configuration command
+			LEDStateResponse = 0x87, ///< CAN2BT -> host, LED state response (ignored)
+			RequestPGNResponse = 0x98, ///< CAN2BT -> host, POLL/request PGN response (ignored)
 			MultipleCANFramesFromDevice = 0xFE ///< CAN2BT -> host, up to 6 frames in one message (firmware v3.00+)
 		};
 
@@ -279,7 +284,7 @@ namespace isobus
 		std::string lastError; ///< The last error
 
 		mutable Mutex settingsMutex; ///< Protects the PIN, mode, baud rate, error and acknowledgement fields
-		Mutex writeMutex; ///< Serialises writes to the converter
+		mutable Mutex connectionMutex; ///< Protects the handle, since the receive thread closes it on a read error while another thread may be writing
 	};
 }
 

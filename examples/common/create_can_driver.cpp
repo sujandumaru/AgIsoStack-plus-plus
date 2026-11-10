@@ -76,6 +76,12 @@ std::shared_ptr<isobus::CANHardwarePlugin> CANDriverFactory::create(const std::s
 		canDriver = std::make_shared<isobus::VirtualCANPlugin>(interfaceName);
 #endif
 	}
+	else if (driver == "ax141150")
+	{
+#if defined(ISOBUS_AX141150_AVAILABLE)
+		canDriver = std::make_shared<isobus::AX141150Plugin>(interfaceName);
+#endif
+	}
 
 	if (nullptr == canDriver)
 	{
@@ -137,5 +143,8 @@ void CANDriverFactory::printAvailableDriverList()
 #endif
 #if defined(ISOBUS_VIRTUALCAN_AVAILABLE)
 	std::cout << " * virtual   - virtual CAN driver for testing purposes" << std::endl;
+#endif
+#if defined(ISOBUS_AX141150_AVAILABLE)
+	std::cout << " * ax141150  - Axiomatic AX141150 Bluetooth converter, the interface is its serial port or Bluetooth address" << std::endl;
 #endif
 }

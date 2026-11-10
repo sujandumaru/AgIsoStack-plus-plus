@@ -7,6 +7,7 @@
 /// @copyright 2026 The Open-Agriculture Developers
 //================================================================================================
 #include "isobus/hardware_integration/axiomatic_ax141150_plugin.hpp"
+#include "isobus/isobus/can_constants.hpp"
 #include "isobus/isobus/can_stack_logger.hpp"
 #include "isobus/utility/system_timing.hpp"
 #include "isobus/utility/to_string.hpp"
@@ -15,6 +16,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -38,170 +40,191 @@
 
 namespace isobus
 {
-	namespace
+	constexpr std::size_t CRC_LENGTH = 4; ///< Bytes of CRC32 at the end of each SPP message
+	constexpr std::size_t HEADER_LENGTH = 2; ///< Type byte and length byte
+	constexpr std::size_t MAX_MESSAGE_LENGTH = std::numeric_limits<std::uint8_t>::max(); ///< The length field is one byte
+	constexpr std::size_t READ_CHUNK_SIZE = 512; ///< Bytes read from the converter per call
+	constexpr std::size_t MAX_RECEIVE_BUFFER_SIZE = 4096; ///< Guard against unbounded growth of the receive buffer
+	constexpr std::size_t STANDARD_IDENTIFIER_LENGTH = 2; ///< Bytes of identifier in a standard frame record
+	constexpr std::size_t EXTENDED_IDENTIFIER_LENGTH = 4; ///< Bytes of identifier in an extended frame record
+	constexpr std::size_t MAX_FRAME_RECORD_LENGTH = 1 + EXTENDED_IDENTIFIER_LENGTH + 1 + CAN_DATA_LENGTH; ///< Type, identifier, data length and data of one record
+	constexpr std::size_t MAX_FRAMES_PER_MULTIPLE_FRAMES_MESSAGE = 6; ///< Frame records in one MultipleCANFramesFromDevice message
+	constexpr std::uint32_t STANDARD_IDENTIFIER_MASK = 0x7FF; ///< The 11 identifier bits of a standard frame
+	constexpr std::uint32_t EXTENDED_IDENTIFIER_MASK = 0x1FFFFFFF; ///< The 29 identifier bits of an extended frame
+	constexpr std::uint32_t STANDARD_RTR_FLAG = 0x0800; ///< Bit 11 of a standard identifier field
+	constexpr std::uint32_t EXTENDED_RTR_FLAG = 0x80000000; ///< Bit 31 of an extended identifier field
+	constexpr std::uint32_t BITS_PER_BYTE = std::numeric_limits<std::uint8_t>::digits; ///< Shift per byte of a little endian field
+	constexpr std::uint32_t CRC32_INITIAL_VALUE = 0xFFFFFFFF; ///< The zlib CRC32 initial value
+	constexpr std::uint32_t CRC32_POLYNOMIAL = 0xEDB88320; ///< The reflected zlib CRC32 polynomial
+	constexpr std::uint32_t RECEIVE_TIMEOUT_MS = 100; ///< How long one read waits for data
+	constexpr std::uint32_t WRITE_TIMEOUT_MS = 1000; ///< How long one write may block on Windows
+	constexpr std::uint32_t ACKNOWLEDGEMENT_POLL_INTERVAL_MS = 50; ///< How long one read waits while waiting for a configuration acknowledgement
+	constexpr std::size_t BLUETOOTH_ADDRESS_LENGTH = 6; ///< Bytes in a Bluetooth address
+	constexpr std::size_t BLUETOOTH_ADDRESS_TEXT_STRIDE = 3; ///< Two hex digits and a colon per byte in the text form
+	constexpr std::size_t BLUETOOTH_ADDRESS_TEXT_LENGTH = (BLUETOOTH_ADDRESS_LENGTH * BLUETOOTH_ADDRESS_TEXT_STRIDE) - 1; ///< "XX:XX:XX:XX:XX:XX"
+	constexpr std::uint8_t MIN_RFCOMM_CHANNEL = 1; ///< The lowest valid RFCOMM channel
+	constexpr std::uint8_t MAX_RFCOMM_CHANNEL = 30; ///< The highest valid RFCOMM channel
+	constexpr std::uint8_t BITS_PER_NIBBLE = 4; ///< Bits per hex digit
+	constexpr std::uint8_t NIBBLE_MASK = 0x0F; ///< The low hex digit of a byte
+
+	/// @brief Returns true for message types the converter sends to the host, so the decoder can resynchronise quickly
+	/// @param[in] type The message type byte
+	/// @returns `true` if the converter sends this message type
+	static bool is_known_device_message_type(std::uint8_t type)
 	{
-		constexpr std::size_t CRC_LENGTH = 4; ///< Bytes of CRC32 at the end of each SPP message
-		constexpr std::size_t HEADER_LENGTH = 2; ///< Type byte and length byte
-		constexpr std::size_t MAX_MESSAGE_LENGTH = 0xFF; ///< The length field is one byte
-		constexpr std::size_t READ_CHUNK_SIZE = 512; ///< Bytes read from the converter per call
-		constexpr std::size_t MAX_RECEIVE_BUFFER_SIZE = 4096; ///< Guard against unbounded growth of the receive buffer
-		constexpr std::uint32_t STANDARD_RTR_FLAG = 0x0800; ///< Bit 11 of a standard identifier field
-		constexpr std::uint32_t EXTENDED_RTR_FLAG = 0x80000000; ///< Bit 31 of an extended identifier field
-
-		/// @brief Returns true for message types the converter sends to the host, so the decoder can resynchronise quickly
-		bool is_known_device_message_type(std::uint8_t type)
+		bool known = false;
+		switch (static_cast<AX141150Plugin::MessageType>(type))
 		{
-			switch (type)
+			case AX141150Plugin::MessageType::CANDataStandardFromDevice:
+			case AX141150Plugin::MessageType::CANDataExtendedFromDevice:
+			case AX141150Plugin::MessageType::MapWriteResponse:
+			case AX141150Plugin::MessageType::MapReadResponse:
+			case AX141150Plugin::MessageType::DownloadFlashResponse:
+			case AX141150Plugin::MessageType::DownloadFlashAcknowledgeResponse:
+			case AX141150Plugin::MessageType::ChangeConfigurationResponse:
+			case AX141150Plugin::MessageType::LEDStateResponse:
+			case AX141150Plugin::MessageType::RequestPGNResponse:
+			case AX141150Plugin::MessageType::MultipleCANFramesFromDevice:
 			{
-				case 0x21: // CAN data, StdID
-				case 0x31: // CAN data, ExtID
-				case 0x43: // MAP write response
-				case 0x54: // MAP read response
-				case 0x65: // Download flash contents response
-				case 0x75: // Download flash contents ACK response
-				case 0x76: // Change configuration response
-				case 0x87: // LED state response
-				case 0x98: // POLL/Request PGN response
-				case 0xFE: // Multiple CAN Rx frames
-					return true;
-
-				default:
-					return false;
+				known = true;
 			}
+			break;
+
+			default:
+				break;
 		}
+		return known;
+	}
 
-		/// @brief Checks if a length byte is possible for a message type, so a false start doesn't stall the decoder
-		/// waiting for bytes that will never arrive
-		/// @param[in] message The buffer at the candidate start, at least HEADER_LENGTH bytes
-		/// @param[in] available Number of bytes available at `message`
-		bool is_plausible_length(const std::uint8_t *message, std::size_t available)
+	/// @brief Returns the identifier length of a CAN frame record type
+	/// @param[in] recordType The message or record type byte
+	/// @returns The identifier length in bytes, or 0 if the type is not a CAN frame
+	static std::size_t get_identifier_length(std::uint8_t recordType)
+	{
+		std::size_t identifierLength = 0;
+		if (static_cast<std::uint8_t>(AX141150Plugin::MessageType::CANDataStandardFromDevice) == recordType)
 		{
-			const std::uint8_t type = message[0];
-			const std::size_t length = message[1];
+			identifierLength = STANDARD_IDENTIFIER_LENGTH;
+		}
+		else if (static_cast<std::uint8_t>(AX141150Plugin::MessageType::CANDataExtendedFromDevice) == recordType)
+		{
+			identifierLength = EXTENDED_IDENTIFIER_LENGTH;
+		}
+		return identifierLength;
+	}
 
-			if (length < HEADER_LENGTH)
-			{
-				return false;
-			}
+	/// @brief Checks if a length byte is possible for a message type, so a false start doesn't stall the decoder
+	/// waiting for bytes that will never arrive
+	/// @param[in] message The buffer at the candidate start, at least HEADER_LENGTH bytes
+	/// @param[in] available Number of bytes available at `message`
+	/// @returns `true` if the length is possible
+	static bool is_plausible_length(const std::uint8_t *message, std::size_t available)
+	{
+		const std::uint8_t type = message[0];
+		const std::size_t length = message[1];
+		const std::size_t identifierLength = get_identifier_length(type);
+		bool plausible = (length >= HEADER_LENGTH);
 
-			std::size_t identifierLength = 0;
-			if (0x21 == type)
-			{
-				identifierLength = 2;
-			}
-			else if (0x31 == type)
-			{
-				identifierLength = 4;
-			}
-			else if (0xFE == type)
-			{
-				return length <= (HEADER_LENGTH + (6 * (1 + 4 + 1 + 8))); // At most 6 extended frames
-			}
-			else
-			{
-				return true;
-			}
-
-			// Single frame: the length is fully determined by the data length byte
+		if (plausible && (static_cast<std::uint8_t>(AX141150Plugin::MessageType::MultipleCANFramesFromDevice) == type))
+		{
+			plausible = (length <= (HEADER_LENGTH + (MAX_FRAMES_PER_MULTIPLE_FRAMES_MESSAGE * MAX_FRAME_RECORD_LENGTH)));
+		}
+		else if (plausible && (0 != identifierLength))
+		{
+			// A single frame's length is fully determined by its data length byte
 			const std::size_t dataLengthIndex = HEADER_LENGTH + identifierLength;
-			if ((length < (dataLengthIndex + 1)) || (length > (dataLengthIndex + 1 + 8)))
-			{
-				return false;
-			}
-			return (available <= dataLengthIndex) || (length == (dataLengthIndex + 1 + message[dataLengthIndex]));
+			plausible = (length > dataLengthIndex) &&
+			  (length <= (dataLengthIndex + 1 + CAN_DATA_LENGTH)) &&
+			  ((available <= dataLengthIndex) || (length == (dataLengthIndex + 1 + message[dataLengthIndex])));
 		}
+		return plausible;
+	}
 
-		/// @brief Checks if a complete message with a valid CRC starts at `message`
-		/// @param[in] message The candidate start, at least HEADER_LENGTH bytes
-		/// @param[in] available Number of bytes available at `message`
-		bool is_complete_message(const std::uint8_t *message, std::size_t available)
+	/// @brief Checks if a complete message with a valid CRC starts at `message`
+	/// @param[in] message The candidate start, at least HEADER_LENGTH bytes
+	/// @param[in] available Number of bytes available at `message`
+	/// @returns `true` if a complete message with a valid CRC is there
+	static bool is_complete_message(const std::uint8_t *message, std::size_t available)
+	{
+		const std::size_t length = message[1];
+		bool complete = (length >= HEADER_LENGTH) && (available >= (length + CRC_LENGTH));
+
+		if (complete)
 		{
-			const std::size_t length = message[1];
-			if ((length < HEADER_LENGTH) || (available < (length + CRC_LENGTH)))
-			{
-				return false;
-			}
-
 			std::uint32_t receivedCrc = 0;
 			for (std::size_t i = 0; i < CRC_LENGTH; i++)
 			{
-				receivedCrc |= (static_cast<std::uint32_t>(message[length + i]) << (8 * i));
+				receivedCrc |= (static_cast<std::uint32_t>(message[length + i]) << (BITS_PER_BYTE * i));
 			}
-			return receivedCrc == AX141150Plugin::crc32(message, length);
+			complete = (receivedCrc == AX141150Plugin::crc32(message, length));
 		}
+		return complete;
+	}
 
-		/// @brief Decodes one CAN frame record (type byte followed by the frame) starting at `data`
-		/// @returns The number of bytes consumed, or 0 if the record is malformed
-		std::size_t decode_frame_record(std::uint8_t recordType, const std::uint8_t *data, std::size_t length, CANMessageFrame &frame, bool &isRemoteFrame)
+	/// @brief Decodes one CAN frame record (the frame after its type byte) starting at `data`
+	/// @param[in] recordType The type byte of the record
+	/// @param[in] data The record after its type byte
+	/// @param[in] length Number of bytes available at `data`
+	/// @param[out] frame The decoded frame
+	/// @param[out] isRemoteFrame Set if the record is a remote frame
+	/// @returns The number of bytes consumed, or 0 if the record is malformed
+	static std::size_t decode_frame_record(std::uint8_t recordType, const std::uint8_t *data, std::size_t length, CANMessageFrame &frame, bool &isRemoteFrame)
+	{
+		const std::size_t identifierLength = get_identifier_length(recordType);
+		std::size_t consumed = 0;
+
+		if ((0 != identifierLength) && (length > identifierLength))
 		{
-			std::size_t identifierLength = 0;
-
-			if (0x21 == recordType)
-			{
-				identifierLength = 2;
-			}
-			else if (0x31 == recordType)
-			{
-				identifierLength = 4;
-			}
-			else
-			{
-				return 0;
-			}
-
-			if (length < (identifierLength + 1))
-			{
-				return 0;
-			}
-
-			std::uint32_t identifier = 0;
-			for (std::size_t i = 0; i < identifierLength; i++)
-			{
-				identifier |= (static_cast<std::uint32_t>(data[i]) << (8 * i));
-			}
-
 			const std::uint8_t dataLength = data[identifierLength];
-			if ((dataLength > 8) || (length < (identifierLength + 1 + dataLength)))
-			{
-				return 0;
-			}
 
-			if (4 == identifierLength)
+			if ((dataLength <= CAN_DATA_LENGTH) && (length >= (identifierLength + 1 + dataLength)))
 			{
-				isRemoteFrame = (0 != (identifier & EXTENDED_RTR_FLAG));
-				frame.identifier = identifier & 0x1FFFFFFF;
-				frame.isExtendedFrame = true;
-			}
-			else
-			{
-				isRemoteFrame = (0 != (identifier & STANDARD_RTR_FLAG));
-				frame.identifier = identifier & 0x7FF;
-				frame.isExtendedFrame = false;
-			}
-			frame.channel = 0;
-			frame.dataLength = dataLength;
-			std::memset(frame.data, 0, sizeof(frame.data));
-			std::memcpy(frame.data, data + identifierLength + 1, dataLength);
-			frame.timestamp_us = SystemTiming::get_timestamp_us();
-			return identifierLength + 1 + dataLength;
-		}
-
-		/// @brief Formats bytes as hex for logging
-		std::string to_hex(const std::vector<std::uint8_t> &data)
-		{
-			static const char DIGITS[] = "0123456789ABCDEF";
-			std::string text;
-			for (std::uint8_t byte : data)
-			{
-				if (!text.empty())
+				std::uint32_t identifier = 0;
+				for (std::size_t i = 0; i < identifierLength; i++)
 				{
-					text += ' ';
+					identifier |= (static_cast<std::uint32_t>(data[i]) << (BITS_PER_BYTE * i));
 				}
-				text += DIGITS[byte >> 4];
-				text += DIGITS[byte & 0x0F];
+
+				if (EXTENDED_IDENTIFIER_LENGTH == identifierLength)
+				{
+					isRemoteFrame = (0 != (identifier & EXTENDED_RTR_FLAG));
+					frame.identifier = identifier & EXTENDED_IDENTIFIER_MASK;
+					frame.isExtendedFrame = true;
+				}
+				else
+				{
+					isRemoteFrame = (0 != (identifier & STANDARD_RTR_FLAG));
+					frame.identifier = identifier & STANDARD_IDENTIFIER_MASK;
+					frame.isExtendedFrame = false;
+				}
+				frame.channel = 0;
+				frame.dataLength = dataLength;
+				std::memset(frame.data, 0, sizeof(frame.data));
+				std::memcpy(frame.data, data + identifierLength + 1, dataLength);
+				frame.timestamp_us = SystemTiming::get_timestamp_us();
+				consumed = identifierLength + 1 + dataLength;
 			}
-			return text;
 		}
+		return consumed;
+	}
+
+	/// @brief Formats bytes as hex for logging
+	/// @param[in] data The bytes to format
+	/// @returns The bytes as space separated hex
+	static std::string to_hex(const std::vector<std::uint8_t> &data)
+	{
+		static const char DIGITS[] = "0123456789ABCDEF";
+		std::string text;
+		for (std::uint8_t byte : data)
+		{
+			if (!text.empty())
+			{
+				text += ' ';
+			}
+			text += DIGITS[byte >> BITS_PER_NIBBLE];
+			text += DIGITS[byte & NIBBLE_MASK];
+		}
+		return text;
 	}
 
 	AX141150Plugin::AX141150Plugin(const std::string &portOrAddress, Mode mode, const std::string &pin) :
@@ -227,6 +250,7 @@ namespace isobus
 
 	bool AX141150Plugin::get_is_valid() const
 	{
+		LOCK_GUARD(Mutex, connectionMutex);
 #ifdef _WIN32
 		return (nullptr != handle);
 #else
@@ -236,6 +260,7 @@ namespace isobus
 
 	void AX141150Plugin::close()
 	{
+		LOCK_GUARD(Mutex, connectionMutex);
 #ifdef _WIN32
 		if (nullptr != handle)
 		{
@@ -294,7 +319,7 @@ namespace isobus
 	{
 		if (receivedFrames.empty() && get_is_valid())
 		{
-			receive_and_decode(100);
+			receive_and_decode(RECEIVE_TIMEOUT_MS);
 		}
 
 		if (receivedFrames.empty())
@@ -373,7 +398,7 @@ namespace isobus
 
 	bool AX141150Plugin::set_rfcomm_channel(std::uint8_t channel)
 	{
-		if (get_is_valid() || (channel < 1) || (channel > 30))
+		if (get_is_valid() || (channel < MIN_RFCOMM_CHANNEL) || (channel > MAX_RFCOMM_CHANNEL))
 		{
 			return false;
 		}
@@ -426,13 +451,13 @@ namespace isobus
 
 	bool AX141150Plugin::is_bluetooth_address(const std::string &text)
 	{
-		if (17 != text.size())
+		if (BLUETOOTH_ADDRESS_TEXT_LENGTH != text.size())
 		{
 			return false;
 		}
 		for (std::size_t i = 0; i < text.size(); i++)
 		{
-			if (2 == (i % 3))
+			if ((BLUETOOTH_ADDRESS_TEXT_STRIDE - 1) == (i % BLUETOOTH_ADDRESS_TEXT_STRIDE))
 			{
 				if (':' != text[i])
 				{
@@ -449,13 +474,13 @@ namespace isobus
 
 	std::uint32_t AX141150Plugin::crc32(const std::uint8_t *data, std::size_t length)
 	{
-		std::uint32_t crc = 0xFFFFFFFF;
+		std::uint32_t crc = CRC32_INITIAL_VALUE;
 		for (std::size_t i = 0; i < length; i++)
 		{
 			crc ^= data[i];
-			for (std::uint8_t bit = 0; bit < 8; bit++)
+			for (std::uint32_t bit = 0; bit < BITS_PER_BYTE; bit++)
 			{
-				crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
+				crc = (crc >> 1) ^ (CRC32_POLYNOMIAL & (0 - (crc & 1)));
 			}
 		}
 		return ~crc;
@@ -478,40 +503,32 @@ namespace isobus
 		const std::uint32_t crc = crc32(message.data(), message.size());
 		for (std::size_t i = 0; i < CRC_LENGTH; i++)
 		{
-			message.push_back(static_cast<std::uint8_t>(crc >> (8 * i)));
+			message.push_back(static_cast<std::uint8_t>(crc >> (BITS_PER_BYTE * i)));
 		}
 		return message;
 	}
 
 	std::vector<std::uint8_t> AX141150Plugin::encode_can_frame(const CANMessageFrame &canFrame)
 	{
-		if (canFrame.dataLength > 8)
-		{
-			return {};
-		}
+		std::vector<std::uint8_t> message;
 
-		std::vector<std::uint8_t> payload;
-		std::uint8_t type;
-
-		if (canFrame.isExtendedFrame)
+		if (canFrame.dataLength <= CAN_DATA_LENGTH)
 		{
-			const std::uint32_t identifier = canFrame.identifier & 0x1FFFFFFF;
-			type = static_cast<std::uint8_t>(MessageType::CANDataExtendedToDevice);
-			for (std::size_t i = 0; i < 4; i++)
+			const bool extended = canFrame.isExtendedFrame;
+			const std::uint32_t identifier = canFrame.identifier & (extended ? EXTENDED_IDENTIFIER_MASK : STANDARD_IDENTIFIER_MASK);
+			const std::size_t identifierLength = extended ? EXTENDED_IDENTIFIER_LENGTH : STANDARD_IDENTIFIER_LENGTH;
+			const MessageType type = extended ? MessageType::CANDataExtendedToDevice : MessageType::CANDataStandardToDevice;
+			std::vector<std::uint8_t> payload;
+
+			for (std::size_t i = 0; i < identifierLength; i++)
 			{
-				payload.push_back(static_cast<std::uint8_t>(identifier >> (8 * i)));
+				payload.push_back(static_cast<std::uint8_t>(identifier >> (BITS_PER_BYTE * i)));
 			}
+			payload.push_back(canFrame.dataLength);
+			payload.insert(payload.end(), canFrame.data, canFrame.data + canFrame.dataLength);
+			message = encode_message(static_cast<std::uint8_t>(type), payload);
 		}
-		else
-		{
-			const std::uint32_t identifier = canFrame.identifier & 0x7FF;
-			type = static_cast<std::uint8_t>(MessageType::CANDataStandardToDevice);
-			payload.push_back(static_cast<std::uint8_t>(identifier));
-			payload.push_back(static_cast<std::uint8_t>(identifier >> 8));
-		}
-		payload.push_back(canFrame.dataLength);
-		payload.insert(payload.end(), canFrame.data, canFrame.data + canFrame.dataLength);
-		return encode_message(type, payload);
+		return message;
 	}
 
 	void AX141150Plugin::decode_messages(std::vector<std::uint8_t> &buffer,
@@ -630,7 +647,10 @@ namespace isobus
 			fail_open("CreateFile failed with error " + isobus::to_string(GetLastError()) + ".");
 			return false;
 		}
-		handle = portHandle;
+		{
+			LOCK_GUARD(Mutex, connectionMutex);
+			handle = portHandle;
+		}
 
 		DCB settings;
 		std::memset(&settings, 0, sizeof(settings));
@@ -658,13 +678,13 @@ namespace isobus
 			return false;
 		}
 
-		// Return from ReadFile as soon as any byte arrives, or after 100 ms with nothing
+		// Return from ReadFile as soon as any byte arrives, or after RECEIVE_TIMEOUT_MS with nothing
 		COMMTIMEOUTS timeouts;
 		std::memset(&timeouts, 0, sizeof(timeouts));
 		timeouts.ReadIntervalTimeout = MAXDWORD;
 		timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
-		timeouts.ReadTotalTimeoutConstant = 100;
-		timeouts.WriteTotalTimeoutConstant = 1000;
+		timeouts.ReadTotalTimeoutConstant = RECEIVE_TIMEOUT_MS;
+		timeouts.WriteTotalTimeoutConstant = WRITE_TIMEOUT_MS;
 		if (!SetCommTimeouts(portHandle, &timeouts))
 		{
 			fail_open("SetCommTimeouts failed with error " + isobus::to_string(GetLastError()) + ".");
@@ -673,7 +693,10 @@ namespace isobus
 		PurgeComm(portHandle, PURGE_RXCLEAR | PURGE_TXCLEAR);
 		return true;
 #else
-		fileDescriptor = ::open(portOrAddress.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+		{
+			LOCK_GUARD(Mutex, connectionMutex);
+			fileDescriptor = ::open(portOrAddress.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+		}
 		if (-1 == fileDescriptor)
 		{
 			fail_open("open() failed: " + std::string(std::strerror(errno)));
@@ -716,7 +739,7 @@ namespace isobus
 		struct RfcommSocketAddress
 		{
 			sa_family_t family;
-			std::uint8_t address[6];
+			std::uint8_t address[BLUETOOTH_ADDRESS_LENGTH];
 			std::uint8_t channel;
 		};
 		static_assert(2 == offsetof(RfcommSocketAddress, address), "Unexpected sockaddr_rc layout");
@@ -729,13 +752,16 @@ namespace isobus
 		std::memset(&socketAddress, 0, sizeof(socketAddress));
 		socketAddress.family = ADDRESS_FAMILY_BLUETOOTH;
 		socketAddress.channel = rfcommChannel;
-		for (std::size_t i = 0; i < 6; i++)
+		for (std::size_t i = 0; i < BLUETOOTH_ADDRESS_LENGTH; i++)
 		{
 			// BlueZ stores the address least significant byte first, the text form is most significant first
-			socketAddress.address[5 - i] = static_cast<std::uint8_t>(std::stoul(portOrAddress.substr(i * 3, 2), nullptr, 16));
+			socketAddress.address[BLUETOOTH_ADDRESS_LENGTH - 1 - i] = static_cast<std::uint8_t>(std::stoul(portOrAddress.substr(i * BLUETOOTH_ADDRESS_TEXT_STRIDE, BLUETOOTH_ADDRESS_TEXT_STRIDE - 1), nullptr, 16));
 		}
 
-		fileDescriptor = socket(ADDRESS_FAMILY_BLUETOOTH, SOCK_STREAM, PROTOCOL_RFCOMM);
+		{
+			LOCK_GUARD(Mutex, connectionMutex);
+			fileDescriptor = socket(ADDRESS_FAMILY_BLUETOOTH, SOCK_STREAM, PROTOCOL_RFCOMM);
+		}
 		if (-1 == fileDescriptor)
 		{
 			fail_open("socket() failed: " + std::string(std::strerror(errno)) + ". Is Bluetooth available on this system?");
@@ -800,7 +826,7 @@ namespace isobus
 
 			while ((!acknowledged) && get_is_valid() && (!SystemTiming::time_expired_ms(startTime, DEFAULT_CONFIGURATION_TIMEOUT_MS)))
 			{
-				receive_and_decode(50);
+				receive_and_decode(ACKNOWLEDGEMENT_POLL_INTERVAL_MS);
 				LOCK_GUARD(Mutex, settingsMutex);
 				acknowledged = (configurationResponseCount > responsesBefore);
 			}
@@ -826,33 +852,30 @@ namespace isobus
 
 	bool AX141150Plugin::write_bytes(const std::vector<std::uint8_t> &data)
 	{
-		if (data.empty() || !get_is_valid())
-		{
-			return false;
-		}
-
-		LOCK_GUARD(Mutex, writeMutex);
+		LOCK_GUARD(Mutex, connectionMutex);
 #ifdef _WIN32
 		DWORD written = 0;
-		return (TRUE == WriteFile(static_cast<HANDLE>(handle), data.data(), static_cast<DWORD>(data.size()), &written, nullptr)) &&
+		return (!data.empty()) &&
+		  (nullptr != handle) &&
+		  (TRUE == WriteFile(static_cast<HANDLE>(handle), data.data(), static_cast<DWORD>(data.size()), &written, nullptr)) &&
 		  (written == data.size());
 #else
+		bool success = (!data.empty()) && (-1 != fileDescriptor);
 		std::size_t total = 0;
-		while (total < data.size())
+		while (success && (total < data.size()))
 		{
 			const ssize_t result = ::write(fileDescriptor, data.data() + total, data.size() - total);
-			if (result < 0)
+			if (result >= 0)
 			{
-				if (EINTR == errno)
-				{
-					continue;
-				}
-				set_last_error("write() failed: " + std::string(std::strerror(errno)));
-				return false;
+				total += static_cast<std::size_t>(result);
 			}
-			total += static_cast<std::size_t>(result);
+			else if (EINTR != errno)
+			{
+				set_last_error("write() failed: " + std::string(std::strerror(errno)));
+				success = false;
+			}
 		}
-		return true;
+		return success;
 #endif
 	}
 
